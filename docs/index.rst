@@ -18,6 +18,7 @@ Ultimate Sitemap Parser
     guides/performance
     guides/security
     guides/http-client
+    guides/alternate-diagnostics
 
 .. toctree::
     :hidden:

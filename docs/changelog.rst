@@ -1,6 +1,13 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+**New Features**
+
+* Added the offline :mod:`usp.diagnostics` package and the ``usp alternate-check`` CLI command to diagnose ``hreflang`` alternate relationships from already collected sitemap data, without requesting page bodies. The analyzer normalizes language tags case-insensitively per BCP 47 (with ``x-default`` handled separately), keeps both the original and normalized URL identity, builds stable content-derived translation cluster ids, and reports duplicate per-language targets, missing self-references, confirmed missing reciprocal links and contradictory cluster-wide targets. Coverage can be declared complete or partial; targets outside an incomplete crawl are reported as insufficient evidence rather than missing back-links and keep the report out of the "all passed" state.
+
 v1.8.1 (2026-06-16)
 -------------------
 

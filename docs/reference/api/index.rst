@@ -6,6 +6,7 @@ Python API Reference
     :titlesonly:
 
     usp.exceptions
+    usp.diagnostics
     usp.fetch_parse
     usp.helpers
     usp.objects
