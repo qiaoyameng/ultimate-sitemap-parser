@@ -48,6 +48,7 @@ def sitemap_tree_for_homepage(
     recurse_callback: RecurseCallbackType | None = None,
     recurse_list_callback: RecurseListCallbackType | None = None,
     normalize_homepage_url: bool = True,
+    accept_no_namespace: bool = False,
 ) -> AbstractSitemap:
     """
     Using a homepage URL, fetch the tree of sitemaps and pages listed in them.
@@ -63,6 +64,11 @@ def sitemap_tree_for_homepage(
     :param normalize_homepage_url: Whether to normalize the provided homepage URL to the domain root (default: True),
         e.g. "http://www.example.com/xxx/yyy/" -> "http://www.example.com/".
         Disabling this may prevent sitemap discovery via robots.txt, as robots.txt is typically only available at the domain root.
+    :param accept_no_namespace: Whether to accept legacy XML sitemaps whose root
+        ``<urlset>`` / ``<sitemapindex>`` declares no namespace (default: ``False``).
+        By default only documents using the full, supported namespace URIs are parsed;
+        enabling this does not relax namespace matching for any other elements, so
+        unknown namespaces are still ignored rather than treated as sitemap elements.
 
     :return: Root sitemap object of the fetched sitemap tree.
     """
@@ -95,6 +101,7 @@ def sitemap_tree_for_homepage(
             parent_urls=set(),
             recurse_callback=recurse_callback,
             recurse_list_callback=recurse_list_callback,
+            accept_no_namespace=accept_no_namespace,
         )
         robots_txt_sitemap = robots_txt_fetcher.sitemap()
         if not isinstance(robots_txt_sitemap, InvalidSitemap):
@@ -118,6 +125,7 @@ def sitemap_tree_for_homepage(
                     quiet_404=True,
                     recurse_callback=recurse_callback,
                     recurse_list_callback=recurse_list_callback,
+                    accept_no_namespace=accept_no_namespace,
                 )
                 unpublished_sitemap = unpublished_sitemap_fetcher.sitemap()
 
@@ -130,13 +138,20 @@ def sitemap_tree_for_homepage(
     return index_sitemap
 
 
-def sitemap_from_str(content: str) -> AbstractSitemap:
+def sitemap_from_str(
+    content: str, accept_no_namespace: bool = False
+) -> AbstractSitemap:
     """Parse sitemap from a string.
 
     Will return the parsed sitemaps, and any sub-sitemaps will be returned as :class:`~.InvalidSitemap`.
 
     :param content: Sitemap string to parse
+    :param accept_no_namespace: Whether to accept legacy XML sitemaps whose root
+        ``<urlset>`` / ``<sitemapindex>`` declares no namespace. See
+        :func:`sitemap_tree_for_homepage` for the exact semantics.
     :return: Parsed sitemap
     """
-    fetcher = SitemapStrParser(static_content=content)
+    fetcher = SitemapStrParser(
+        static_content=content, accept_no_namespace=accept_no_namespace
+    )
     return fetcher.sitemap()

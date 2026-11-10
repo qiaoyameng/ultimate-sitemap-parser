@@ -11,3 +11,4 @@ Python API Reference
     usp.objects
     usp.tree
     usp.web_client
+    usp.xml_namespaces

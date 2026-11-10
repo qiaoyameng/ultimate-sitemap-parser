@@ -52,6 +52,15 @@ from .web_client.abstract_client import (
     WebClientErrorResponse,
 )
 from .web_client.requests_client import RequestsWebClient
+from .xml_namespaces import (
+    ATOM_0_3_NAMESPACE_URI,
+    ATOM_1_0_NAMESPACE_URI,
+    NAMESPACE_TOKENS,
+    SITEMAP_ACCEPTED_NAMESPACE_URIS,
+    SITEMAP_NAMESPACE_URI,
+    clark_name,
+    element_position,
+)
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +89,7 @@ class SitemapFetcher:
         "_quiet_404",
         "_recurse_callback",
         "_recurse_list_callback",
+        "_accept_no_namespace",
     ]
 
     def __init__(
@@ -91,6 +101,7 @@ class SitemapFetcher:
         quiet_404: bool = False,
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        accept_no_namespace: bool = False,
     ):
         """
 
@@ -101,6 +112,9 @@ class SitemapFetcher:
         :param quiet_404: Whether 404 errors are expected and should be logged at a reduced level, useful for speculative fetching of known URLs.
         :param recurse_callback: Optional callback to filter out a sub-sitemap. See :data:`~.RecurseCallbackType`.
         :param recurse_list_callback: Optional callback to filter the list of sub-sitemaps. See :data:`~.RecurseListCallbackType`.
+        :param accept_no_namespace: Whether to accept legacy XML sitemaps whose root
+            ``<urlset>`` / ``<sitemapindex>`` carries no namespace. Defaults to ``False``:
+            only documents using the full, supported namespace URIs are accepted.
 
         :raises SitemapException: If the maximum recursion depth is exceeded.
         :raises SitemapException: If the URL is in the parent URLs set.
@@ -137,6 +151,7 @@ class SitemapFetcher:
 
         self._recurse_callback = recurse_callback
         self._recurse_list_callback = recurse_list_callback
+        self._accept_no_namespace = accept_no_namespace
 
     def _fetch(self) -> AbstractWebClientResponse:
         log.info(f"Fetching level {self._recursion_level} sitemap from {self._url}...")
@@ -189,6 +204,7 @@ class SitemapFetcher:
                 parent_urls=self._parent_urls,
                 recurse_callback=self._recurse_callback,
                 recurse_list_callback=self._recurse_list_callback,
+                accept_no_namespace=self._accept_no_namespace,
             )
 
         else:
@@ -202,6 +218,7 @@ class SitemapFetcher:
                     parent_urls=self._parent_urls,
                     recurse_callback=self._recurse_callback,
                     recurse_list_callback=self._recurse_list_callback,
+                    accept_no_namespace=self._accept_no_namespace,
                 )
             else:
                 parser = PlainTextSitemapParser(
@@ -227,15 +244,18 @@ class SitemapStrParser(SitemapFetcher):
 
     __slots__ = ["_static_content"]
 
-    def __init__(self, static_content: str):
+    def __init__(self, static_content: str, accept_no_namespace: bool = False):
         """Init a new string parser
 
         :param static_content: String containing sitemap text to parse
+        :param accept_no_namespace: Whether to accept legacy XML sitemaps without a
+            namespace on their root element. See :class:`SitemapFetcher`.
         """
         super().__init__(
             url="http://usp-local-dummy.local/",
             recursion_level=0,
             web_client=LocalWebClient(),
+            accept_no_namespace=accept_no_namespace,
         )
         self._static_content = static_content
 
@@ -254,6 +274,7 @@ class AbstractSitemapParser(metaclass=abc.ABCMeta):
         "_parent_urls",
         "_recurse_callback",
         "_recurse_list_callback",
+        "_accept_no_namespace",
     ]
 
     def __init__(
@@ -265,12 +286,14 @@ class AbstractSitemapParser(metaclass=abc.ABCMeta):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        accept_no_namespace: bool = False,
     ):
         self._url = url
         self._content = content
         self._recursion_level = recursion_level
         self._web_client = web_client
         self._parent_urls = parent_urls
+        self._accept_no_namespace = accept_no_namespace
 
         if recurse_callback is None:  # Always allow child recursion
             self._recurse_callback = lambda url, level, parent_urls: True
@@ -304,6 +327,7 @@ class IndexRobotsTxtSitemapParser(AbstractSitemapParser):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        accept_no_namespace: bool = False,
     ):
         super().__init__(
             url=url,
@@ -313,6 +337,7 @@ class IndexRobotsTxtSitemapParser(AbstractSitemapParser):
             parent_urls=parent_urls,
             recurse_callback=recurse_callback,
             recurse_list_callback=recurse_list_callback,
+            accept_no_namespace=accept_no_namespace,
         )
 
         if not self._url.endswith("/robots.txt"):
@@ -357,6 +382,7 @@ class IndexRobotsTxtSitemapParser(AbstractSitemapParser):
                         parent_urls=parent_urls,
                         recurse_callback=self._recurse_callback,
                         recurse_list_callback=self._recurse_list_callback,
+                        accept_no_namespace=self._accept_no_namespace,
                     )
                     fetched_sitemap = fetcher.sitemap()
                 else:
@@ -407,13 +433,39 @@ class XMLSitemapParser(AbstractSitemapParser):
 
     Instantiates an Expat parser and registers handler methods, which determine the specific format
     and instantiates a concrete parser (inheriting from :class:`AbstractXMLSitemapParser`) to extract data.
+
+    Namespace handling is strict:
+
+    * Elements are dispatched on the full, exact namespace URI listed in
+      :mod:`usp.xml_namespaces` plus their local name. URI substrings (e.g. a URI that
+      merely contains ``/sitemap/``) and XML prefixes are never used for guessing.
+    * Elements from unknown namespaces start a *foreign subtree* whose whole content,
+      including inner elements whose local names collide with standard ones
+      (``loc``, ``title``, ``link`` ...), is ignored until the subtree closes.
+    * A namespace-less ``<urlset>`` / ``<sitemapindex>`` root is only accepted when
+      ``accept_no_namespace`` is set, and even then elements from other namespaces are
+      not pulled into the sitemap vocabulary.
     """
 
     __XML_NAMESPACE_SEPARATOR = " "
 
     __slots__ = [
         "_concrete_parser",
-        "_is_non_ns_sitemap",
+        "_accept_no_namespace",
+        # Depth of the currently open foreign (unknown namespace) subtree, 0 = not in one
+        "_foreign_depth",
+        # Token prefix implied for elements without a namespace (RSS / legacy sitemap)
+        "_no_ns_token",
+        # Whether a namespace-less document was accepted via the compatibility option
+        "_legacy_no_ns_sitemap",
+        # Full expanded name + position of the root element, for error messages
+        "_root_expanded_name",
+        "_root_position",
+        "_parser",
+        # Whether the document vocabulary only accepts SITEMAP_ACCEPTED_NAMESPACE_URIS
+        "_sitemap_vocabulary",
+        # Exception raised while dispatching the root element, if any
+        "_root_exception",
     ]
 
     def __init__(
@@ -425,6 +477,7 @@ class XMLSitemapParser(AbstractSitemapParser):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        accept_no_namespace: bool = False,
     ):
         super().__init__(
             url=url,
@@ -434,17 +487,107 @@ class XMLSitemapParser(AbstractSitemapParser):
             parent_urls=parent_urls,
             recurse_callback=recurse_callback,
             recurse_list_callback=recurse_list_callback,
+            accept_no_namespace=accept_no_namespace,
         )
 
         # Will be initialized when the type of sitemap is known
         self._concrete_parser = None
-        # Whether this is a malformed sitemap with no namespace
-        self._is_non_ns_sitemap = False
+        # Whether legacy sitemaps without a namespace are explicitly accepted
+        self._accept_no_namespace = accept_no_namespace
+        self._foreign_depth = 0
+        self._no_ns_token = None
+        self._legacy_no_ns_sitemap = False
+        self._root_expanded_name = None
+        self._root_position = None
+        self._parser = None
+        self._sitemap_vocabulary = False
+        self._root_exception = None
+
+    def _split_expanded_name(self, name: str) -> tuple[str, str]:
+        """Split an Expat namespace-aware element name into namespace URI and local name.
+
+        Expat is created with a single-space namespace separator, so an element in a
+        namespace is reported as ``"<namespace-uri> <local-name>"`` and an element
+        without a namespace as the bare local name.
+
+        :param name: Name reported by Expat.
+        :return: Tuple of ``(namespace_uri, local_name)``; the namespace URI is ``""``
+            for elements without a namespace.
+        """
+        name_parts = name.split(self.__XML_NAMESPACE_SEPARATOR)
+
+        if len(name_parts) == 1:
+            return "", name_parts[0]
+
+        if len(name_parts) == 2:
+            return name_parts[0], name_parts[1]
+
+        raise SitemapXMLParsingException(
+            f"Unable to determine namespace for element '{name}'"
+        )
+
+    def _resolve_element(self, name: str) -> tuple[str, str, str, bool]:
+        """Resolve an Expat element name to an internal token plus dispatch metadata.
+
+        No substring or prefix guessing happens: the namespace URI must equal one of the
+        full URIs in :data:`~usp.xml_namespaces.NAMESPACE_TOKENS`.
+
+        :param name: Name reported by Expat.
+        :return: Tuple ``(token, namespace_uri, local_name, is_foreign)`` where
+            ``token`` is the internal name handed to the concrete parser (e.g.
+            ``sitemap:loc``), ``is_foreign`` marks elements belonging to an unsupported
+            namespace whose whole subtree must be ignored.
+        """
+        namespace_uri, local_name = self._split_expanded_name(name)
+
+        if namespace_uri:
+            token_prefix = NAMESPACE_TOKENS.get(namespace_uri)
+            if token_prefix is None:
+                # Unknown namespace: the element and everything beneath it are foreign
+                return local_name, namespace_uri, local_name, True
+            if (
+                self._sitemap_vocabulary
+                and namespace_uri not in SITEMAP_ACCEPTED_NAMESPACE_URIS
+            ):
+                # A known but non-sitemap vocabulary (e.g. Atom) used inside an XML
+                # sitemap is treated as a foreign subtree, not as sitemap data.
+                return local_name, namespace_uri, local_name, True
+            return f"{token_prefix}:{local_name}", namespace_uri, local_name, False
+
+        # Element without a namespace.
+        if self._legacy_no_ns_sitemap:
+            # Legacy sitemap accepted through the explicit compatibility option:
+            # bare elements are treated as sitemap vocabulary elements.
+            return f"sitemap:{local_name}", namespace_uri, local_name, False
+
+        if self._no_ns_token == "atom":
+            # Namespace-less Atom feeds remain accepted for backwards compatibility.
+            return f"atom:{local_name}", namespace_uri, local_name, False
+
+        # RSS 2.0 is namespace-less by specification; its parser works on bare names.
+
+        return local_name, namespace_uri, local_name, False
+
+    def _normalize_attrs(self, attrs: dict[str, str]) -> dict[str, str]:
+        """Drop namespace prefixes from attribute names.
+
+        Attribute namespaces are irrelevant for the supported vocabularies; this keeps
+        both prefixed (``xhtml:href``) and unprefixed (``href``) spellings working.
+        """
+        normalized = {}
+        for attr_name, attr_value in attrs.items():
+            if self.__XML_NAMESPACE_SEPARATOR in attr_name:
+                attr_name = attr_name.split(
+                    self.__XML_NAMESPACE_SEPARATOR, maxsplit=1
+                )[1]
+            normalized[attr_name] = attr_value
+        return normalized
 
     def sitemap(self) -> AbstractSitemap:
         parser = xml.parsers.expat.ParserCreate(
             namespace_separator=self.__XML_NAMESPACE_SEPARATOR
         )
+        self._parser = parser
         parser.StartElementHandler = self._xml_element_start
         parser.EndElementHandler = self._xml_element_end
         parser.CharacterDataHandler = self._xml_char_data
@@ -470,85 +613,65 @@ class XMLSitemapParser(AbstractSitemapParser):
             log.error(f"Parsing sitemap from URL {self._url} failed: {ex}")
 
         if not self._concrete_parser:
+            if self._root_exception is not None:
+                reason = (
+                    f"No parsers support sitemap from {self._url}: "
+                    f"{self._root_exception}"
+                )
+            elif self._root_expanded_name is not None:
+                reason = (
+                    f"No parsers support sitemap from {self._url}: unsupported root "
+                    f"element {clark_name(*self._split_expanded_name(self._root_expanded_name))} "
+                    f"at {self._root_position}"
+                )
+            else:
+                reason = f"No parsers support sitemap from {self._url}"
             return InvalidSitemap(
                 url=self._url,
-                reason=f"No parsers support sitemap from {self._url}",
+                reason=reason,
             )
 
         return self._concrete_parser.sitemap()
 
-    def __normalize_xml_element_name(self, name: str):
-        """
-        Replace the namespace URL in the argument element name with internal namespace.
-
-        * Elements from http://www.sitemaps.org/schemas/sitemap/0.9 namespace will be prefixed with "sitemap:",
-          e.g. "<loc>" will become "<sitemap:loc>"
-
-        * Elements from http://www.google.com/schemas/sitemap-news/0.9 namespace will be prefixed with "news:",
-          e.g. "<publication>" will become "<news:publication>"
-
-        For non-sitemap namespaces, return the element name with the namespace stripped.
-
-        :param name: Namespace URL plus XML element name, e.g. "http://www.sitemaps.org/schemas/sitemap/0.9 loc"
-        :return: Internal namespace name plus element name, e.g. "sitemap loc"
-        """
-
-        name_parts = name.split(self.__XML_NAMESPACE_SEPARATOR)
-
-        if len(name_parts) == 1:
-            namespace_url = ""
-            name = name_parts[0]
-
-        elif len(name_parts) == 2:
-            namespace_url = name_parts[0]
-            name = name_parts[1]
-
-        else:
-            raise SitemapXMLParsingException(
-                f"Unable to determine namespace for element '{name}'"
-            )
-
-        if "/sitemap/" in namespace_url:
-            name = f"sitemap:{name}"
-        elif "/sitemap-news/" in namespace_url:
-            name = f"news:{name}"
-        elif "/sitemap-image/" in namespace_url:
-            name = f"image:{name}"
-        elif "/sitemap-video/" in namespace_url:
-            name = f"video:{name}"
-        elif name in {"urlset", "sitemapindex"}:
-            # XML sitemap root tag but namespace is not set
-            self._is_non_ns_sitemap = True
-            log.warning(
-                f'XML sitemap root tag {name} detected without expected xmlns (value is "{namespace_url}"), '
-                f"assuming is an XML sitemap."
-            )
-            name = f"sitemap:{name}"
-        elif self._is_non_ns_sitemap:
-            # Flag has previously been set and no other namespace matched,
-            # assume this should be in the sitemap namespace
-            log.debug(f"Assuming {name} should be in sitemap namespace")
-            name = f"sitemap:{name}"
-        else:
-            # We don't care about the rest of the namespaces, so just keep the plain element name
-            pass
-
-        return name
-
     def _xml_element_start(self, name: str, attrs: dict[str, str]) -> None:
-        name = self.__normalize_xml_element_name(name)
+        token, namespace_uri, local_name, is_foreign = self._resolve_element(name)
 
         if self._concrete_parser:
-            self._concrete_parser.xml_element_start(name=name, attrs=attrs)
+            if is_foreign:
+                # Inside an unknown namespace subtree: ignore the element and all of
+                # its descendants, including any standard-looking inner elements.
+                self._foreign_depth += 1
+                return
+            if self._foreign_depth > 0:
+                # Descendant of a foreign element (possibly in a known namespace):
+                # still ignored, depth unchanged until the foreign root closes.
+                return
+
+            self._concrete_parser.xml_element_start(
+                name=token, attrs=self._normalize_attrs(attrs)
+            )
 
         else:
+            self._root_expanded_name = name
+            self._root_position = element_position(self._parser)
+
+            if is_foreign:
+                self._root_exception = (
+                    f"Unsupported root element {clark_name(namespace_uri, local_name)} "
+                    f"at {self._root_position}: namespace is not a supported sitemap, "
+                    f"news, image, video, Atom or XHTML namespace."
+                )
+                raise SitemapXMLParsingException(self._root_exception)
+
             # Root element -- initialize concrete parser
-            if name == "sitemap:urlset":
+            if token == "sitemap:urlset":
+                self._sitemap_vocabulary = True
                 self._concrete_parser = PagesXMLSitemapParser(
                     url=self._url,
                 )
 
-            elif name == "sitemap:sitemapindex":
+            elif token == "sitemap:sitemapindex":
+                self._sitemap_vocabulary = True
                 self._concrete_parser = IndexXMLSitemapParser(
                     url=self._url,
                     web_client=self._web_client,
@@ -556,32 +679,89 @@ class XMLSitemapParser(AbstractSitemapParser):
                     parent_urls=self._parent_urls,
                     recurse_callback=self._recurse_callback,
                     recurse_list_callback=self._recurse_list_callback,
+                    accept_no_namespace=self._accept_no_namespace,
                 )
 
-            elif name == "rss":
+            elif local_name == "rss" and not namespace_uri:
+                # RSS 2.0 is namespace-less by specification
+                self._no_ns_token = "rss"
                 self._concrete_parser = PagesRSSSitemapParser(
                     url=self._url,
                 )
 
-            elif name == "feed":
+            elif namespace_uri in (ATOM_1_0_NAMESPACE_URI, ATOM_0_3_NAMESPACE_URI):
+                # Both Atom 0.3 and Atom 1.0 resolve to the "atom" token prefix
                 self._concrete_parser = PagesAtomSitemapParser(
                     url=self._url,
                 )
 
+            elif local_name == "feed" and not namespace_uri:
+                # Backwards-compatible handling of namespace-less Atom feeds
+                self._no_ns_token = "atom"
+                self._concrete_parser = PagesAtomSitemapParser(
+                    url=self._url,
+                )
+
+            elif (
+                local_name in {"urlset", "sitemapindex"} and not namespace_uri
+            ):
+                if not self._accept_no_namespace:
+                    self._root_exception = (
+                        f"Root element {clark_name(namespace_uri, local_name)} at "
+                        f"{self._root_position} has no namespace; strict namespace "
+                        f"mode expects {SITEMAP_NAMESPACE_URI}. Re-parse with "
+                        f"accept_no_namespace=True to accept this legacy document."
+                    )
+                    raise SitemapXMLParsingException(self._root_exception)
+                log.warning(
+                    f'XML sitemap root tag {local_name} detected without expected xmlns '
+                    f'(value is "") at {self._root_position}; accepting because '
+                    f"accept_no_namespace is enabled."
+                )
+                self._legacy_no_ns_sitemap = True
+                self._sitemap_vocabulary = True
+                if local_name == "urlset":
+                    self._concrete_parser = PagesXMLSitemapParser(
+                        url=self._url,
+                    )
+                else:
+                    self._concrete_parser = IndexXMLSitemapParser(
+                        url=self._url,
+                        web_client=self._web_client,
+                        recursion_level=self._recursion_level,
+                        parent_urls=self._parent_urls,
+                        recurse_callback=self._recurse_callback,
+                        recurse_list_callback=self._recurse_list_callback,
+                        accept_no_namespace=self._accept_no_namespace,
+                    )
+
             else:
-                raise SitemapXMLParsingException(f"Unsupported root element '{name}'.")
+                self._root_exception = (
+                    f"Unsupported root element {clark_name(namespace_uri, local_name)} "
+                    f"at {self._root_position}."
+                )
+                raise SitemapXMLParsingException(self._root_exception)
 
     def _xml_element_end(self, name: str) -> None:
-        name = self.__normalize_xml_element_name(name)
+        token, namespace_uri, local_name, is_foreign = self._resolve_element(name)
+
+        if self._foreign_depth > 0:
+            self._foreign_depth -= 1
+            return
 
         if not self._concrete_parser:
             raise SitemapXMLParsingException(
                 "Concrete sitemap parser should be set by now."
             )
 
-        self._concrete_parser.xml_element_end(name=name)
+        self._concrete_parser.xml_element_end(name=token)
 
     def _xml_char_data(self, data: str) -> None:
+        if self._foreign_depth > 0:
+            # Character data of foreign subtrees must not leak into the buffer used
+            # for standard elements.
+            return
+
         if not self._concrete_parser:
             raise SitemapXMLParsingException(
                 "Concrete sitemap parser should be set by now."
@@ -687,6 +867,7 @@ class IndexXMLSitemapParser(AbstractXMLSitemapParser):
         # List of sub-sitemap URLs found in this index sitemap
         "_sub_sitemap_urls",
         "_parent_urls",
+        "_accept_no_namespace",
     ]
 
     def __init__(
@@ -697,6 +878,7 @@ class IndexXMLSitemapParser(AbstractXMLSitemapParser):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        accept_no_namespace: bool = False,
     ):
         super().__init__(
             url=url,
@@ -708,6 +890,7 @@ class IndexXMLSitemapParser(AbstractXMLSitemapParser):
         self._recursion_level = recursion_level
         self._sub_sitemap_urls = []
         self._parent_urls = parent_urls
+        self._accept_no_namespace = accept_no_namespace
 
     def xml_element_end(self, name: str) -> None:
         if name == "sitemap:loc":
@@ -743,6 +926,7 @@ class IndexXMLSitemapParser(AbstractXMLSitemapParser):
                         parent_urls=parent_urls,
                         recurse_callback=self._recurse_callback,
                         recurse_list_callback=self._recurse_list_callback,
+                        accept_no_namespace=self._accept_no_namespace,
                     )
                     fetched_sitemap = fetcher.sitemap()
                 else:
@@ -975,16 +1159,16 @@ class PagesXMLSitemapParser(AbstractXMLSitemapParser):
                     "Page is expected to be set before <image:image>."
                 )
             self._current_image = self.Image()
-        elif name == "link":
+        elif name == "xhtml:link":
             if not self._current_page:
                 raise SitemapXMLParsingException(
-                    "Page is expected to be set before <link>."
+                    "Page is expected to be set before <xhtml:link>."
                 )
             if "rel" not in attrs or attrs["rel"] != "alternate":
-                log.warning(f"<link> element is missing rel attribute: {attrs}.")
+                log.warning(f"<xhtml:link> element is missing rel attribute: {attrs}.")
             elif "hreflang" not in attrs or "href" not in attrs:
                 log.warning(
-                    f"<link> element is missing hreflang or href attributes: {attrs}."
+                    f"<xhtml:link> element is missing hreflang or href attributes: {attrs}."
                 )
             else:
                 self._current_page.alternates.append((attrs["hreflang"], attrs["href"]))
@@ -1299,14 +1483,14 @@ class PagesAtomSitemapParser(AbstractXMLSitemapParser):
     def xml_element_start(self, name: str, attrs: dict[str, str]) -> None:
         super().xml_element_start(name=name, attrs=attrs)
 
-        if name == "entry":
+        if name == "atom:entry":
             if self._current_page:
                 raise SitemapXMLParsingException(
                     "Page is expected to be unset by <entry>."
                 )
             self._current_page = self.Page()
 
-        elif name == "link":
+        elif name == "atom:link":
             if self._current_page:
                 if (
                     attrs.get("rel", "self").lower() == "self"
@@ -1323,7 +1507,7 @@ class PagesAtomSitemapParser(AbstractXMLSitemapParser):
     def xml_element_end(self, name: str) -> None:
         # If within <entry> already
         if self._current_page:
-            if name == "entry":
+            if name == "atom:entry":
                 if self._last_link_rel_self_href:
                     self._current_page.link = self._last_link_rel_self_href
                     self._last_link_rel_self_href = None
@@ -1335,21 +1519,21 @@ class PagesAtomSitemapParser(AbstractXMLSitemapParser):
                 self._current_page = None
 
             else:
-                if name == "title":
+                if name == "atom:title":
                     # Title (if set) can't be empty
                     self.__require_last_char_data_to_be_set(name=name)
                     self._current_page.title = self._last_char_data
 
-                elif name == "tagline" or name == "summary":
+                elif name == "atom:tagline" or name == "atom:summary":
                     # Description (if set) can't be empty
                     self.__require_last_char_data_to_be_set(name=name)
                     self._current_page.description = self._last_char_data
 
-                elif name == "issued" or name == "published":
+                elif name == "atom:issued" or name == "atom:published":
                     # Element might be present but character data might be empty
                     self._current_page.publication_date = self._last_char_data
 
-                elif name == "updated":
+                elif name == "atom:updated":
                     # No 'issued' or 'published' were set before
                     if not self._current_page.publication_date:
                         self._current_page.publication_date = self._last_char_data

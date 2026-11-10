@@ -1,6 +1,21 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+**Security**
+
+* XML namespace dispatch is now strict: sitemap, Google News, Image, Video, Atom and XHTML elements are matched against the full, supported namespace URI plus their local name instead of URI substrings such as ``/sitemap/``. Namespace URIs that merely look like a standard one (e.g. ``http://example.org/sitemap/0.9``) are no longer treated as standard elements.
+* Elements from unknown namespaces now open a foreign subtree whose entire content, including standard-looking inner elements such as ``loc``, ``title`` or ``link``, is ignored until the subtree closes, so extension wrappers can no longer pollute parsed page fields or be mistaken for direct children.
+* ``<xhtml:link rel="alternate">`` hreflang alternates are only accepted from the XHTML namespace; bare or foreign-namespace ``link`` elements no longer populate the ``alternates`` field.
+
+**Changed**
+
+* Namespace-less ``<urlset>`` / ``<sitemapindex>`` documents are rejected by default. Use the new ``accept_no_namespace=True`` option of :func:`~usp.tree.sitemap_tree_for_homepage` and :func:`~usp.tree.sitemap_from_str` to parse these legacy documents. Enabling it does not relax namespace matching for any explicitly namespaced element.
+* Namespace-less RSS 2.0 (namespace-less by specification) and legacy namespace-less Atom feeds continue to be parsed without any option.
+* Parse errors now retain the real expanded element name in Clark notation and the element's line/column position.
+
 v1.8.1 (2026-06-16)
 -------------------
 

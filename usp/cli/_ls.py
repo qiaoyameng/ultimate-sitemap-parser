@@ -41,6 +41,14 @@ def register(subparsers):
         help="don't discover sitemaps through well-known URLs",
     )
     ls_parser.add_argument(
+        "--accept-no-namespace",
+        action="store_true",
+        help=(
+            "accept legacy XML sitemaps whose root <urlset>/<sitemapindex> has no "
+            "namespace (strict namespace matching is used by default)"
+        ),
+    )
+    ls_parser.add_argument(
         "-u",
         "--strip-url",
         action="store_true",
@@ -61,7 +69,12 @@ def register(subparsers):
         type=str,
         help="write log to this file and suppress console output",
     )
-    ls_parser.set_defaults(no_robots=False, no_known=False, strip_url=False)
+    ls_parser.set_defaults(
+        no_robots=False,
+        no_known=False,
+        strip_url=False,
+        accept_no_namespace=False,
+    )
 
     ls_parser.set_defaults(func=ls)
 
@@ -106,6 +119,7 @@ def ls(args):
         args.url,
         use_robots=not args.no_robots,
         use_known_paths=not args.no_known,
+        accept_no_namespace=args.accept_no_namespace,
     )
 
     strip_prefix = ""

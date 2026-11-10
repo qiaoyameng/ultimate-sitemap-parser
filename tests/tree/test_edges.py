@@ -234,7 +234,8 @@ class TestTreeEdgeCases(TreeTestBase):
         assert len(all_pages) == 49
         assert all_pages[-1].url.endswith("page_48.html")
 
-    def test_sitemap_no_ns(self, requests_mock, caplog):
+    def test_sitemap_no_ns_rejected_by_default(self, requests_mock, caplog):
+        """Namespace-less sitemap roots are rejected in strict default mode."""
         requests_mock.add_matcher(TreeTestBase.fallback_to_404_not_found_matcher)
 
         requests_mock.get(
@@ -286,6 +287,81 @@ class TestTreeEdgeCases(TreeTestBase):
             ).strip(),
         )
 
+        actual_sitemap_tree = sitemap_tree_for_homepage(homepage_url=self.TEST_BASE_URL)
+
+        # The namespace-less index must be rejected, rather than silently assumed to be
+        # a sitemap vocabulary document. Its children are never fetched.
+        invalid_sitemaps = [
+            sitemap
+            for sitemap in actual_sitemap_tree.all_sitemaps()
+            if isinstance(sitemap, InvalidSitemap)
+            and "sitemap_index.xml" in sitemap.url
+        ]
+        assert len(invalid_sitemaps) == 1
+        reason = invalid_sitemaps[0].reason
+        assert "has no namespace" in reason
+        # Error must retain the real expanded name (unqualified here) and position
+        assert "sitemapindex" in reason
+        assert "line" in reason
+        assert list(actual_sitemap_tree.all_pages()) == []
+
+    def test_sitemap_no_ns_accepted_with_compat_option(
+        self, requests_mock, caplog
+    ):
+        """Namespace-less sitemaps are parsed when accept_no_namespace=True."""
+        requests_mock.add_matcher(TreeTestBase.fallback_to_404_not_found_matcher)
+
+        requests_mock.get(
+            self.TEST_BASE_URL + "/robots.txt",
+            headers={"Content-Type": "text/plain"},
+            text=textwrap.dedent(
+                f"""
+                        User-agent: *
+                        Disallow: whatever
+
+                        Sitemap: {self.TEST_BASE_URL}/sitemap_index.xml
+                    """
+            ).strip(),
+        )
+
+        requests_mock.get(
+            self.TEST_BASE_URL + "/sitemap_index.xml",
+            headers={"Content-Type": "application/xml"},
+            text=textwrap.dedent(
+                f"""
+                        <?xml version="1.0" encoding="UTF-8"?>
+                        <sitemapindex>
+                            <sitemap>
+                                <loc>{self.TEST_BASE_URL}/sitemap_pages.xml</loc>
+                                <lastmod>{self.TEST_DATE_STR_ISO8601}</lastmod>
+                            </sitemap>
+                        </sitemapindex>
+                    """
+            ).strip(),
+        )
+
+        # random_tag is to check accepting legacy documents doesn't raise on unknown
+        # bare elements
+        requests_mock.get(
+            self.TEST_BASE_URL + "/sitemap_pages.xml",
+            headers={"Content-Type": "application/xml",
+            },
+            text=textwrap.dedent(
+                f"""
+                        <?xml version="1.0" encoding="UTF-8"?>
+                        <urlset>
+                            <url>
+                                <loc>{self.TEST_BASE_URL}/about.html</loc>
+                                <lastmod>{self.TEST_DATE_STR_ISO8601}</lastmod>
+                                <changefreq>monthly</changefreq>
+                                <priority>0.8</priority>
+                                <random_tag>random_value</random_tag>
+                            </url>
+                        </urlset>
+                    """
+            ).strip(),
+        )
+
         expected_sitemap_tree = IndexWebsiteSitemap(
             url=f"{self.TEST_BASE_URL}/",
             sub_sitemaps=[
@@ -313,11 +389,12 @@ class TestTreeEdgeCases(TreeTestBase):
             ],
         )
 
-        actual_sitemap_tree = sitemap_tree_for_homepage(homepage_url=self.TEST_BASE_URL)
+        actual_sitemap_tree = sitemap_tree_for_homepage(
+            homepage_url=self.TEST_BASE_URL, accept_no_namespace=True
+        )
 
         assert expected_sitemap_tree == actual_sitemap_tree
         assert (
             'sitemapindex detected without expected xmlns (value is "")' in caplog.text
         )
         assert 'urlset detected without expected xmlns (value is "")' in caplog.text
-        assert "Assuming random_tag should be in sitemap namespace" in caplog.text

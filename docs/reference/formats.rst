@@ -92,11 +92,35 @@ Supports the following non-standard features:
 - Truncated files (perhaps because the web server timed out while serving the file) will be parsed as much as possible
 - Any unexpected tags are ignored
 - Timestamps are :ref:`parsed flexibly <xml date>`
-- Sitemaps without an XML namespace will be parsed as if it was there, so long as there is still a root ``<sitemapindex>`` or ``<urlset>`` element.
 
 .. note::
 
-    Namespaces must be declared to parse extensions correctly. Any unrecognised namespaces will be ignored.
+    Namespace handling is strict. Elements are dispatched from the *full* namespace
+    URI plus their local name -- namespace URI substrings (for example a URI that
+    merely contains ``/sitemap/``) and XML prefixes are never used for guessing, so
+    re-binding the ``sitemap`` prefix to a different URI has no effect and a
+    spoofed URI such as ``http://example.org/sitemap/0.9`` is not accepted.
+
+    The accepted, full namespace URIs are:
+
+    - Sitemap / sitemap index: ``http://www.sitemaps.org/schemas/sitemap/0.9``
+    - Google News: ``http://www.google.com/schemas/sitemap-news/0.9``
+    - Google Image: ``http://www.google.com/schemas/sitemap-image/1.1``
+    - Google Video: ``http://www.google.com/schemas/sitemap-video/1.1`` (recognized, but its fields are not extracted)
+    - XHTML alternates (``<xhtml:link rel="alternate">``): ``http://www.w3.org/1999/xhtml``
+
+    Any unrecognised namespace starts a *foreign subtree* whose whole content is
+    ignored until the subtree closes. In particular, an element named ``loc``,
+    ``title`` or ``link`` inside an unknown wrapper can never overwrite a field
+    parsed from the standard vocabulary, and inner elements of a foreign subtree
+    are not treated as direct children of the surrounding ``<url>`` entry.
+
+    Legacy documents whose root ``<urlset>`` / ``<sitemapindex>`` carries no
+    namespace are rejected by default. Pass ``accept_no_namespace=True`` to
+    :func:`~usp.tree.sitemap_tree_for_homepage` or
+    :func:`~usp.tree.sitemap_from_str` to parse them. This only relaxes handling
+    of the namespace-less root and its bare descendants; elements in other,
+    explicitly declared namespaces are still matched strictly.
 
 .. _xml sitemap extensions:
 
