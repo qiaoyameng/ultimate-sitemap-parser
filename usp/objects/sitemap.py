@@ -110,12 +110,23 @@ class AbstractSitemap(metaclass=abc.ABCMeta):
         raise NotImplementedError("Abstract method")
 
     # TODO: return custom iterator with set length here?
-    def all_pages(self) -> Iterator[SitemapPage]:
+    def all_pages(self, _seen: set[int] | None = None) -> Iterator[SitemapPage]:
         """
         Return iterator which yields all pages of this sitemap and linked sitemaps (if any).
 
+        Each distinct sitemap object is traversed at most once. When the same sitemap is
+        reachable from several parents (graph reuse), its pages are yielded from the first
+        branch that reaches it; later references are skipped rather than traversed again.
+        This keeps iteration finite even when sub-sitemaps share children, while the tree
+        structure still retains every parent-child reference.
+
         :return: Iterator which yields all pages of this sitemap and linked sitemaps (if any).
         """
+        if _seen is None:
+            _seen = set()
+        if id(self) in _seen:
+            return
+        _seen.add(id(self))
         yield from self.pages
 
     @property
@@ -130,12 +141,19 @@ class AbstractSitemap(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError("Abstract method")
 
-    def all_sitemaps(self) -> Iterator["AbstractSitemap"]:
+    def all_sitemaps(self, _seen: set[int] | None = None) -> Iterator["AbstractSitemap"]:
         """
         Return iterator which yields all sub-sitemaps descended from this sitemap.
 
+        Each distinct sitemap object is yielded at most once (first occurrence, in
+        depth-first pre-order), even if it is referenced by multiple parents. A cyclic
+        reference that was recorded as an :class:`InvalidSitemap` is therefore reached
+        once and iteration always terminates.
+
         :return: Iterator which yields all sub-sitemaps descended from this sitemap.
         """
+        if _seen is None:
+            _seen = set()
         yield from self.sub_sitemaps
 
 
@@ -393,24 +411,41 @@ class AbstractIndexSitemap(AbstractSitemap):
         """
         return []
 
-    def all_pages(self) -> Iterator[SitemapPage]:
+    def all_pages(self, _seen: set[int] | None = None) -> Iterator[SitemapPage]:
         """
         Return iterator which yields all pages of this sitemap and linked sitemaps (if any).
 
+        Traverses each distinct sitemap object at most once, see
+        :meth:`AbstractSitemap.all_pages`.
+
         :return: Iterator which yields all pages of this sitemap and linked sitemaps (if any).
         """
+        if _seen is None:
+            _seen = set()
+        if id(self) in _seen:
+            return
+        _seen.add(id(self))
         for sub_sitemap in self.sub_sitemaps:
-            yield from sub_sitemap.all_pages()
+            yield from sub_sitemap.all_pages(_seen=_seen)
 
-    def all_sitemaps(self) -> Iterator["AbstractSitemap"]:
+    def all_sitemaps(self, _seen: set[int] | None = None) -> Iterator["AbstractSitemap"]:
         """
         Return iterator which yields all sub-sitemaps of this sitemap.
 
+        Each distinct sitemap object is yielded at most once (first occurrence, depth-first
+        pre-order), so shared sub-sitemaps do not cause duplicate output or infinite
+        recursion, see :meth:`AbstractSitemap.all_sitemaps`.
+
         :return: Iterator which yields all sub-sitemaps of this sitemap.
         """
+        if _seen is None:
+            _seen = set()
         for sub_sitemap in self.sub_sitemaps:
+            if id(sub_sitemap) in _seen:
+                continue
+            _seen.add(id(sub_sitemap))
             yield sub_sitemap
-            yield from sub_sitemap.all_sitemaps()
+            yield from sub_sitemap.all_sitemaps(_seen=_seen)
 
 
 class IndexWebsiteSitemap(AbstractIndexSitemap):

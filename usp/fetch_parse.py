@@ -14,6 +14,11 @@ import xml.parsers.expat
 from collections import OrderedDict
 from decimal import Decimal, InvalidOperation
 
+from .crawl_context import (
+    DEFAULT_MAX_SITEMAP_NODES,
+    SitemapCrawlContext,
+    normalize_sitemap_url,
+)
 from .exceptions import SitemapException, SitemapXMLParsingException
 from .helpers import (
     RecurseCallbackType,
@@ -80,6 +85,8 @@ class SitemapFetcher:
         "_quiet_404",
         "_recurse_callback",
         "_recurse_list_callback",
+        "_crawl_context",
+        "_max_sitemap_nodes",
     ]
 
     def __init__(
@@ -91,6 +98,8 @@ class SitemapFetcher:
         quiet_404: bool = False,
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        crawl_context: SitemapCrawlContext | None = None,
+        max_sitemap_nodes: int = DEFAULT_MAX_SITEMAP_NODES,
     ):
         """
 
@@ -101,9 +110,15 @@ class SitemapFetcher:
         :param quiet_404: Whether 404 errors are expected and should be logged at a reduced level, useful for speculative fetching of known URLs.
         :param recurse_callback: Optional callback to filter out a sub-sitemap. See :data:`~.RecurseCallbackType`.
         :param recurse_list_callback: Optional callback to filter the list of sub-sitemaps. See :data:`~.RecurseListCallbackType`.
+        :param crawl_context: Shared crawl context used to deduplicate fetches across the
+            whole traversal and to distinguish cross-branch reuse from ancestor-chain
+            cycles. If ``None``, a new context is created, which preserves the behaviour
+            of a standalone fetcher.
+        :param max_sitemap_nodes: Maximum number of distinct sitemap resources that may
+            be fetched within the (newly created) crawl context. Ignored when
+            ``crawl_context`` is supplied, as the shared context owns the limit.
 
         :raises SitemapException: If the maximum recursion depth is exceeded.
-        :raises SitemapException: If the URL is in the parent URLs set.
         :raises SitemapException: If the URL is not an HTTP(S) URL
         """
         if recursion_level > self.__MAX_RECURSION_LEVEL:
@@ -117,12 +132,6 @@ class SitemapFetcher:
             raise SitemapException(f"URL {url} is not a HTTP(s) URL.")
 
         parent_urls = parent_urls or set()
-
-        if url in parent_urls:
-            # Likely a sitemap index points to itself/a higher level index
-            raise SitemapException(
-                f"Recursion detected in URL {url} with parent URLs {parent_urls}."
-            )
 
         if not web_client:
             web_client = RequestsWebClient()
@@ -138,6 +147,11 @@ class SitemapFetcher:
         self._recurse_callback = recurse_callback
         self._recurse_list_callback = recurse_list_callback
 
+        if crawl_context is None:
+            crawl_context = SitemapCrawlContext(max_sitemap_nodes=max_sitemap_nodes)
+        self._crawl_context = crawl_context
+        self._max_sitemap_nodes = max_sitemap_nodes
+
     def _fetch(self) -> AbstractWebClientResponse:
         log.info(f"Fetching level {self._recursion_level} sitemap from {self._url}...")
         response = get_url_retry_on_client_errors(
@@ -151,29 +165,131 @@ class SitemapFetcher:
 
         :return: the parsed sitemap. Will be a child of :class:`~.AbstractSitemap`.
             If an HTTP error is encountered, or the sitemap cannot be parsed, will be :class:`~.InvalidSitemap`.
+
+        Within a shared :class:`~.crawl_context.SitemapCrawlContext`, a resource that has
+        already been fetched and parsed on another branch is returned directly (the same
+        object, including a shared failure state) without issuing another request. A URL
+        that is already present on the current ancestor chain is a genuine cycle and is
+        returned as an :class:`~.InvalidSitemap` carrying the cyclic URL path.
         """
+        request_url = self._url
+        request_key = normalize_sitemap_url(request_url)
+        if request_key is None:
+            return InvalidSitemap(
+                url=request_url,
+                reason=f"Unable to normalize sitemap URL {request_url}.",
+            )
+
+        context = self._crawl_context
+
+        # The resource might already have been processed through an alias (e.g. a
+        # redirect followed earlier on another branch). Cross-branch reuse must not
+        # trigger a cycle error, and must not issue another request.
+        cached_sitemap = context.get_node(request_key)
+        if cached_sitemap is not None:
+            log.info(
+                f"Sitemap {request_url} was already fetched on another branch, "
+                f"reusing cached result."
+            )
+            return cached_sitemap
+
+        if context.is_active(request_key):
+            # Genuine cycle within the current ancestor chain
+            cycle_path = context.cycle_path(repeated_key=request_key)
+            cycle_path_str = " -> ".join(cycle_path)
+            return InvalidSitemap(
+                url=request_url,
+                reason=(
+                    f"Recursion detected in URL {request_url} with parent URLs "
+                    f"{self._parent_urls}. Cycle path: {cycle_path_str}."
+                ),
+            )
+
+        # Fetching a new distinct node; the node limit only counts distinct resources.
+        context.check_node_limit(url=request_url)
+        context.push(request_key)
+        try:
+            sitemap = self._fetch_and_parse(request_url=request_url, request_key=request_key)
+        finally:
+            context.pop(request_key)
+
+        return sitemap
+
+    def _fetch_and_parse(
+        self, request_url: str, request_key: str
+    ) -> AbstractSitemap:
+        """Fetch and parse a resource known not to be cached or cyclic.
+
+        :param request_url: Requested URL as declared by the parent sitemap.
+        :param request_key: Normalized requested URL used as a crawl-context key.
+        :return: The parsed sitemap, or an :class:`~.InvalidSitemap` on failure/cycle.
+        """
+        context = self._crawl_context
         response = self._fetch()
 
         if isinstance(response, WebClientErrorResponse):
-            return InvalidSitemap(
+            invalid_sitemap = InvalidSitemap(
                 url=self._url,
                 reason=f"Unable to fetch sitemap from {self._url}: {response.message()}",
             )
+            # Failure state is shared by every parent referencing this resource
+            context.store_result(
+                request_key=request_key,
+                final_key=request_key,
+                result=invalid_sitemap,
+                is_new_node=True,
+            )
+            return invalid_sitemap
         assert isinstance(response, AbstractWebClientSuccessResponse)
 
-        response_url = response.url()
+        response_url = response.url() or request_url
         log.debug(f"Response URL is {response_url}")
-        if response_url in self._parent_urls:
-            # Likely a sitemap has redirected to a parent URL
-            return InvalidSitemap(
-                url=self._url,
-                reason=f"Recursion detected when {self._url} redirected to {response_url} with parent URLs {self._parent_urls}.",
-            )
+        response_key = normalize_sitemap_url(response_url)
+        if response_key is None:
+            response_key = request_key
+            response_url = request_url
 
-        self._url = response_url
+        is_new_node = True
+        if response_key != request_key:
+            # The request was redirected (possibly through several hops) to another URL.
+            cached_sitemap = context.get_node(response_key)
+            if cached_sitemap is not None:
+                # Same resource already processed elsewhere: register the alias and reuse
+                context.store_result(
+                    request_key=request_key,
+                    final_key=response_key,
+                    result=cached_sitemap,
+                    is_new_node=False,
+                )
+                log.info(
+                    f"Sitemap {request_url} redirected to already processed "
+                    f"{response_url}, reusing cached result."
+                )
+                return cached_sitemap
+
+            if context.is_active(response_key):
+                # Redirect closes a loop in the current ancestor chain
+                cycle_path = context.cycle_path(
+                    repeated_key=response_key,
+                    request_key=request_key,
+                    via_redirect=True,
+                )
+                cycle_path_str = " -> ".join(cycle_path)
+                return InvalidSitemap(
+                    url=request_url,
+                    reason=(
+                        f"Recursion detected when {request_url} redirected to "
+                        f"{response_url} with parent URLs {self._parent_urls}. "
+                        f"Cycle path: {cycle_path_str}."
+                    ),
+                )
+
+            # New final URL. The ancestor-chain entry stays under the requested URL so
+            # that any later cycle reports the actual request path (including the
+            # redirecting URL), while the response URL is recorded as an alias below.
 
         response_content = ungzipped_response_content(
-            url=self._url,
+            url=response_url,
             response=response,
             max_uncompressed_bytes=self.__MAX_SITEMAP_SIZE,
         )
@@ -182,38 +298,51 @@ class SitemapFetcher:
         if response_content[:20].strip().startswith("<"):
             # XML sitemap (the specific kind is to be determined later)
             parser = XMLSitemapParser(
-                url=self._url,
+                url=response_url,
                 content=response_content,
                 recursion_level=self._recursion_level,
                 web_client=self._web_client,
                 parent_urls=self._parent_urls,
                 recurse_callback=self._recurse_callback,
                 recurse_list_callback=self._recurse_list_callback,
+                crawl_context=context,
+                max_sitemap_nodes=self._max_sitemap_nodes,
             )
 
         else:
             # Assume that it's some sort of a text file (robots.txt or plain text sitemap)
-            if self._url.endswith("/robots.txt"):
+            if response_url.endswith("/robots.txt"):
                 parser = IndexRobotsTxtSitemapParser(
-                    url=self._url,
+                    url=response_url,
                     content=response_content,
                     recursion_level=self._recursion_level,
                     web_client=self._web_client,
                     parent_urls=self._parent_urls,
                     recurse_callback=self._recurse_callback,
                     recurse_list_callback=self._recurse_list_callback,
+                    crawl_context=context,
+                    max_sitemap_nodes=self._max_sitemap_nodes,
                 )
             else:
                 parser = PlainTextSitemapParser(
-                    url=self._url,
+                    url=response_url,
                     content=response_content,
                     recursion_level=self._recursion_level,
                     web_client=self._web_client,
                     parent_urls=self._parent_urls,
                 )
 
-        log.info(f"Parsing sitemap from URL {self._url}...")
+        log.info(f"Parsing sitemap from URL {response_url}...")
         sitemap = parser.sitemap()
+
+        context.store_result(
+            request_key=request_key,
+            final_key=response_key,
+            result=sitemap,
+            is_new_node=is_new_node,
+        )
+
+        self._url = response_url
 
         return sitemap
 
@@ -254,6 +383,8 @@ class AbstractSitemapParser(metaclass=abc.ABCMeta):
         "_parent_urls",
         "_recurse_callback",
         "_recurse_list_callback",
+        "_crawl_context",
+        "_max_sitemap_nodes",
     ]
 
     def __init__(
@@ -265,12 +396,18 @@ class AbstractSitemapParser(metaclass=abc.ABCMeta):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        crawl_context: SitemapCrawlContext | None = None,
+        max_sitemap_nodes: int = DEFAULT_MAX_SITEMAP_NODES,
     ):
         self._url = url
         self._content = content
         self._recursion_level = recursion_level
         self._web_client = web_client
         self._parent_urls = parent_urls
+        self._crawl_context = crawl_context or SitemapCrawlContext(
+            max_sitemap_nodes=max_sitemap_nodes
+        )
+        self._max_sitemap_nodes = max_sitemap_nodes
 
         if recurse_callback is None:  # Always allow child recursion
             self._recurse_callback = lambda url, level, parent_urls: True
@@ -304,6 +441,8 @@ class IndexRobotsTxtSitemapParser(AbstractSitemapParser):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        crawl_context: SitemapCrawlContext | None = None,
+        max_sitemap_nodes: int = DEFAULT_MAX_SITEMAP_NODES,
     ):
         super().__init__(
             url=url,
@@ -313,6 +452,8 @@ class IndexRobotsTxtSitemapParser(AbstractSitemapParser):
             parent_urls=parent_urls,
             recurse_callback=recurse_callback,
             recurse_list_callback=recurse_list_callback,
+            crawl_context=crawl_context,
+            max_sitemap_nodes=max_sitemap_nodes,
         )
 
         if not self._url.endswith("/robots.txt"):
@@ -357,6 +498,8 @@ class IndexRobotsTxtSitemapParser(AbstractSitemapParser):
                         parent_urls=parent_urls,
                         recurse_callback=self._recurse_callback,
                         recurse_list_callback=self._recurse_list_callback,
+                        crawl_context=self._crawl_context,
+                        max_sitemap_nodes=self._max_sitemap_nodes,
                     )
                     fetched_sitemap = fetcher.sitemap()
                 else:
@@ -425,6 +568,8 @@ class XMLSitemapParser(AbstractSitemapParser):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        crawl_context: SitemapCrawlContext | None = None,
+        max_sitemap_nodes: int = DEFAULT_MAX_SITEMAP_NODES,
     ):
         super().__init__(
             url=url,
@@ -434,6 +579,8 @@ class XMLSitemapParser(AbstractSitemapParser):
             parent_urls=parent_urls,
             recurse_callback=recurse_callback,
             recurse_list_callback=recurse_list_callback,
+            crawl_context=crawl_context,
+            max_sitemap_nodes=max_sitemap_nodes,
         )
 
         # Will be initialized when the type of sitemap is known
@@ -556,6 +703,8 @@ class XMLSitemapParser(AbstractSitemapParser):
                     parent_urls=self._parent_urls,
                     recurse_callback=self._recurse_callback,
                     recurse_list_callback=self._recurse_list_callback,
+                    crawl_context=self._crawl_context,
+                    max_sitemap_nodes=self._max_sitemap_nodes,
                 )
 
             elif name == "rss":
@@ -603,6 +752,9 @@ class AbstractXMLSitemapParser(metaclass=abc.ABCMeta):
         "_last_handler_call_was_xml_char_data",
         "_recurse_callback",
         "_recurse_list_callback",
+        # Shared crawl context for the traversal this parser belongs to
+        "_crawl_context",
+        "_max_sitemap_nodes",
     ]
 
     def __init__(
@@ -697,6 +849,8 @@ class IndexXMLSitemapParser(AbstractXMLSitemapParser):
         parent_urls: set[str],
         recurse_callback: RecurseCallbackType | None = None,
         recurse_list_callback: RecurseListCallbackType | None = None,
+        crawl_context: SitemapCrawlContext | None = None,
+        max_sitemap_nodes: int = DEFAULT_MAX_SITEMAP_NODES,
     ):
         super().__init__(
             url=url,
@@ -708,6 +862,10 @@ class IndexXMLSitemapParser(AbstractXMLSitemapParser):
         self._recursion_level = recursion_level
         self._sub_sitemap_urls = []
         self._parent_urls = parent_urls
+        if crawl_context is None:
+            crawl_context = SitemapCrawlContext(max_sitemap_nodes=max_sitemap_nodes)
+        self._crawl_context = crawl_context
+        self._max_sitemap_nodes = max_sitemap_nodes
 
     def xml_element_end(self, name: str) -> None:
         if name == "sitemap:loc":
@@ -743,6 +901,8 @@ class IndexXMLSitemapParser(AbstractXMLSitemapParser):
                         parent_urls=parent_urls,
                         recurse_callback=self._recurse_callback,
                         recurse_list_callback=self._recurse_list_callback,
+                        crawl_context=self._crawl_context,
+                        max_sitemap_nodes=self._max_sitemap_nodes,
                     )
                     fetched_sitemap = fetcher.sitemap()
                 else:

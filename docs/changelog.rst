@@ -1,6 +1,36 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+**New Features**
+
+* A single sitemap tree traversal now shares a crawl context
+  (:class:`usp.crawl_context.SitemapCrawlContext`), so a sub-sitemap referenced by
+  several sitemap indexes is fetched and parsed only once while remaining attached to
+  every parent. Request URLs and their redirect final URLs are registered as aliases;
+  URL normalization only applies safe equivalences (scheme/host case, default ports and
+  fragments) and never removes query parameters.
+* Added the ``max_sitemap_nodes`` parameter to
+  :func:`usp.tree.sitemap_tree_for_homepage` to bound the number of distinct sitemap
+  resources fetched within one traversal (reused and cyclic references do not count
+  again).
+
+**Bug Fixes**
+
+* Cross-branch reuse of an already processed sitemap is no longer confused with a
+  recursion error. A genuine ancestor-chain cycle (including one closed by a redirect)
+  is returned as an :class:`~usp.objects.sitemap.InvalidSitemap` carrying the ordered
+  cycle path.
+* A failed sub-sitemap now produces a single shared
+  :class:`~usp.objects.sitemap.InvalidSitemap` visible from every parent path, instead
+  of being re-requested once per parent.
+* :meth:`~usp.objects.sitemap.AbstractSitemap.all_sitemaps` and
+  :meth:`~usp.objects.sitemap.AbstractSitemap.all_pages` visit each distinct sitemap
+  object at most once, so graph reuse can no longer cause duplicate output or infinite
+  recursion.
+
 v1.8.1 (2026-06-16)
 -------------------
 

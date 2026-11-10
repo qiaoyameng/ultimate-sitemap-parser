@@ -99,10 +99,70 @@ Deduplication
 
 During the parse process, some de-duplication is performed within each individual sitemap. In an index sitemap, only the first declaration of a sub-sitemap is fetched. In a page sitemap, only the first declaration of a page is included.
 
-However, this means that if a sub-sitemap is declared in multiple index sitemaps, or a page is declared in multiple page sitemaps, it will be included multiple times.
+A whole traversal (one call to :func:`~usp.tree.sitemap_tree_for_homepage`) shares a single
+:class:`~usp.crawl_context.SitemapCrawlContext`. It makes sure that each distinct sitemap
+resource is fetched and parsed only once, even when several sitemap indexes reference it.
+The parsed sitemap object is then attached to every parent that references it, so all
+parent-child relationships are retained while duplicate HTTP requests and parses are
+avoided. This also covers failures: a sitemap that cannot be fetched or parsed produces a
+single shared :class:`~usp.objects.sitemap.InvalidSitemap`, visible from every parent
+path, and is never re-requested.
 
-Recursion is detected in the following cases, and will result in the sitemap being returned as an :class:`~usp.objects.sitemap.InvalidSitemap`:
+URL identity
+~~~~~~~~~~~~
 
-- A sitemap's URL is identical to any of its ancestor sitemaps' URLs.
-- When fetched, a sitemap redirects to a URL that is identical to any of its ancestor sitemaps' URLs.
-- When fetching known site map locations, a sitemap redirects to a sitemap already parsed from ``robots.txt``.
+Resources are keyed by their normalized URL, using the conservative rules of
+:func:`~usp.crawl_context.normalize_sitemap_url`. Only unambiguous equivalences are
+applied: the scheme and host are lower-cased, default ports removed and fragments
+dropped. The path case, percent-encoding and the full query string (including every
+query parameter) are preserved, so two URLs that differ in their query string are never
+merged.
+
+When a request URL is redirected to a different final URL, the two are registered as
+aliases of the same resource. A later reference to either the request URL or the final
+URL therefore reuses the already fetched sitemap instead of requesting it again.
+
+Reuse versus cycles
+~~~~~~~~~~~~~~~~~~~
+
+Two kinds of repeated references need to be distinguished:
+
+- A resource already fully processed on a *different* branch of the tree is reused
+  directly. This is ordinary graph reuse and is never treated as recursion.
+- A resource that is already present on the *current ancestor chain* is a genuine cycle.
+  It is returned as an :class:`~usp.objects.sitemap.InvalidSitemap` whose reason includes
+  the ordered cycle path, for example
+  ``http://example.com/a.xml -> http://example.com/b.xml -> http://example.com/a.xml``.
+
+Recursion is therefore reported as an :class:`~usp.objects.sitemap.InvalidSitemap` in the
+following cases:
+
+- A sitemap's URL is identical to one of its ancestor sitemaps' URLs.
+- When fetched, a sitemap redirects to a URL identical to one of its ancestor sitemaps'
+  URLs.
+
+Limits
+~~~~~~
+
+The traversal enforces two independent limits:
+
+- a maximum recursion depth (``SitemapFetcher`` level), which bounds how deeply nested
+  sub-sitemaps may be; and
+- a maximum number of distinct sitemap nodes, configurable through the
+  ``max_sitemap_nodes`` argument of :func:`~usp.tree.sitemap_tree_for_homepage` (see
+  :data:`~usp.crawl_context.DEFAULT_MAX_SITEMAP_NODES`). Reused and cyclic references do
+  not consume additional node slots.
+
+Exceeding either limit produces an :class:`~usp.objects.sitemap.InvalidSitemap` on the
+offending branch rather than raising, so the rest of the tree remains usable.
+
+Iterating the result
+~~~~~~~~~~~~~~~~~~~~
+
+Because the constructed object graph may share children,
+:meth:`~usp.objects.sitemap.AbstractSitemap.all_sitemaps` and
+:meth:`~usp.objects.sitemap.AbstractSitemap.all_pages` traverse each distinct sitemap
+object at most once (first occurrence, depth-first pre-order). This guarantees that
+iteration always terminates even with shared or cyclic references. The underlying
+``sub_sitemaps`` structure still keeps every parent-child reference, including duplicate
+references to the same object.

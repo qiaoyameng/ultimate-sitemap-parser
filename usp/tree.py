@@ -2,6 +2,11 @@
 
 import logging
 
+from .crawl_context import (
+    DEFAULT_MAX_SITEMAP_NODES,
+    SitemapCrawlContext,
+    normalize_sitemap_url,
+)
 from .exceptions import SitemapException
 from .fetch_parse import SitemapFetcher, SitemapStrParser
 from .helpers import (
@@ -48,6 +53,7 @@ def sitemap_tree_for_homepage(
     recurse_callback: RecurseCallbackType | None = None,
     recurse_list_callback: RecurseListCallbackType | None = None,
     normalize_homepage_url: bool = True,
+    max_sitemap_nodes: int = DEFAULT_MAX_SITEMAP_NODES,
 ) -> AbstractSitemap:
     """
     Using a homepage URL, fetch the tree of sitemaps and pages listed in them.
@@ -63,6 +69,11 @@ def sitemap_tree_for_homepage(
     :param normalize_homepage_url: Whether to normalize the provided homepage URL to the domain root (default: True),
         e.g. "http://www.example.com/xxx/yyy/" -> "http://www.example.com/".
         Disabling this may prevent sitemap discovery via robots.txt, as robots.txt is typically only available at the domain root.
+    :param max_sitemap_nodes: Maximum number of distinct sitemap resources fetched during
+        this traversal. Sitemaps referenced from several parents (including via redirect
+        aliases) are only fetched once and do not consume additional slots. Exceeding the
+        limit produces an :class:`~.InvalidSitemap` at the offending branch instead of
+        fetching further.
 
     :return: Root sitemap object of the fetched sitemap tree.
     """
@@ -71,6 +82,11 @@ def sitemap_tree_for_homepage(
         raise SitemapException(f"URL {homepage_url} is not a HTTP(s) URL.")
 
     extra_known_paths = extra_known_paths or set()
+
+    # One shared context for the whole traversal: every fetcher deduplicates against it,
+    # so a sub-sitemap referenced by multiple sitemap indexes is fetched only once while
+    # remaining attached to all of its parents.
+    crawl_context = SitemapCrawlContext(max_sitemap_nodes=max_sitemap_nodes)
 
     if normalize_homepage_url:
         stripped_homepage_url = strip_url_to_homepage(url=homepage_url)
@@ -95,6 +111,8 @@ def sitemap_tree_for_homepage(
             parent_urls=set(),
             recurse_callback=recurse_callback,
             recurse_list_callback=recurse_list_callback,
+            crawl_context=crawl_context,
+            max_sitemap_nodes=max_sitemap_nodes,
         )
         robots_txt_sitemap = robots_txt_fetcher.sitemap()
         if not isinstance(robots_txt_sitemap, InvalidSitemap):
@@ -105,6 +123,13 @@ def sitemap_tree_for_homepage(
                 sitemap_urls_found_in_robots_txt.add(sub_sitemap.url)
 
     if use_known_paths:
+        # Final (post-redirect, normalized) URLs of every resource already reached while
+        # processing robots.txt, used to skip speculative known paths resolving to them.
+        robots_discovered_keys = {
+            normalize_sitemap_url(url)
+            for url in sitemap_urls_found_in_robots_txt
+            if isinstance(url, str)
+        }
         for unpublished_sitemap_path in _UNPUBLISHED_SITEMAP_PATHS | extra_known_paths:
             unpublished_sitemap_url = homepage_url + unpublished_sitemap_path
 
@@ -118,12 +143,31 @@ def sitemap_tree_for_homepage(
                     quiet_404=True,
                     recurse_callback=recurse_callback,
                     recurse_list_callback=recurse_list_callback,
+                    crawl_context=crawl_context,
+                    max_sitemap_nodes=max_sitemap_nodes,
                 )
                 unpublished_sitemap = unpublished_sitemap_fetcher.sitemap()
 
-                # Skip the ones that weren't found
-                if not isinstance(unpublished_sitemap, InvalidSitemap):
-                    sitemaps.append(unpublished_sitemap)
+                # Skip the ones that weren't found, and also speculative known paths that
+                # redirected to (or were already fetched as) a sitemap discovered
+                # elsewhere, e.g. through robots.txt.
+                if isinstance(unpublished_sitemap, InvalidSitemap):
+                    continue
+                resolved_key = (
+                    normalize_sitemap_url(unpublished_sitemap.url)
+                    if isinstance(unpublished_sitemap.url, str)
+                    else None
+                )
+                if (
+                    unpublished_sitemap.url in {s.url for s in sitemaps}
+                    or resolved_key in robots_discovered_keys
+                ):
+                    log.info(
+                        f"Known path {unpublished_sitemap_url} resolved to already "
+                        f"discovered sitemap {unpublished_sitemap.url}, skipping."
+                    )
+                    continue
+                sitemaps.append(unpublished_sitemap)
 
     index_sitemap = IndexWebsiteSitemap(url=homepage_url, sub_sitemaps=sitemaps)
 

@@ -4,6 +4,7 @@ from unittest import mock
 import pytest
 
 from tests.tree.base import TreeTestBase
+from usp.crawl_context import DEFAULT_MAX_SITEMAP_NODES
 from usp.tree import sitemap_tree_for_homepage
 
 
@@ -24,6 +25,8 @@ class TestTreeOpts(TreeTestBase):
             quiet_404=True,
             recurse_callback=None,
             recurse_list_callback=None,
+            crawl_context=mock.ANY,
+            max_sitemap_nodes=DEFAULT_MAX_SITEMAP_NODES,
         )
 
     def test_filter_callback(self, requests_mock):
@@ -72,6 +75,8 @@ class TestTreeOpts(TreeTestBase):
             parent_urls=set(),
             recurse_callback=None,
             recurse_list_callback=None,
+            crawl_context=mock.ANY,
+            max_sitemap_nodes=DEFAULT_MAX_SITEMAP_NODES,
         )
 
     def test_normalize_homepage_url_disabled(self, mock_fetcher):
@@ -91,6 +96,8 @@ class TestTreeOpts(TreeTestBase):
             parent_urls=set(),
             recurse_callback=None,
             recurse_list_callback=None,
+            crawl_context=mock.ANY,
+            max_sitemap_nodes=DEFAULT_MAX_SITEMAP_NODES,
         )
 
     def test_normalize_homepage_url_with_extra_known_paths(self, mock_fetcher):
@@ -112,6 +119,8 @@ class TestTreeOpts(TreeTestBase):
             quiet_404=True,
             recurse_callback=None,
             recurse_list_callback=None,
+            crawl_context=mock.ANY,
+            max_sitemap_nodes=DEFAULT_MAX_SITEMAP_NODES,
         )
 
         mock_fetcher.assert_any_call(
@@ -122,6 +131,8 @@ class TestTreeOpts(TreeTestBase):
             quiet_404=True,
             recurse_callback=None,
             recurse_list_callback=None,
+            crawl_context=mock.ANY,
+            max_sitemap_nodes=DEFAULT_MAX_SITEMAP_NODES,
         )
 
     def test_skip_robots_txt(self, mock_fetcher):
@@ -144,4 +155,6 @@ class TestTreeOpts(TreeTestBase):
             quiet_404=True,
             recurse_callback=None,
             recurse_list_callback=None,
+            crawl_context=mock.ANY,
+            max_sitemap_nodes=DEFAULT_MAX_SITEMAP_NODES,
         )
