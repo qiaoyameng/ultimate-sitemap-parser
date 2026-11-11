@@ -295,6 +295,14 @@ class AbstractSitemapParser(metaclass=abc.ABCMeta):
 class IndexRobotsTxtSitemapParser(AbstractSitemapParser):
     """robots.txt index sitemap parser."""
 
+    __slots__ = [
+        "_web_client",
+        "_recursion_level",
+        # List of sitemap URLs found in this robots.txt
+        "_sub_sitemap_urls",
+        "_parent_urls",
+    ]
+
     def __init__(
         self,
         url: str,
@@ -320,6 +328,11 @@ class IndexRobotsTxtSitemapParser(AbstractSitemapParser):
                 f"URL does not look like robots.txt URL: {self._url}"
             )
 
+        self._web_client = web_client
+        self._recursion_level = recursion_level
+        self._sub_sitemap_urls = []
+        self._parent_urls = parent_urls
+
     def sitemap(self) -> AbstractSitemap:
         # Serves as an ordered set because we want to deduplicate URLs but also retain the order
         sitemap_urls = OrderedDict()
@@ -339,6 +352,7 @@ class IndexRobotsTxtSitemapParser(AbstractSitemapParser):
                         f"Sitemap URL {sitemap_url} doesn't look like an URL, skipping"
                     )
 
+        self._sub_sitemap_urls = list(sitemap_urls.keys())
         sub_sitemaps = []
         parent_urls = self._parent_urls | {self._url}
 
@@ -1367,3 +1381,72 @@ class PagesAtomSitemapParser(AbstractXMLSitemapParser):
         pages_sitemap = PagesAtomSitemap(url=self._url, pages=pages)
 
         return pages_sitemap
+
+
+def parse_sitemap_content(
+    url: str,
+    content: str,
+    recursion_level: int = 0,
+    web_client: AbstractWebClient | None = None,
+    parent_urls: set[str] | None = None,
+) -> tuple[AbstractSitemap, list[str]]:
+    """Parse one sitemap node without recursively fetching its children.
+
+    Reuses the regular parsers but blocks all recursion via a callback, so the
+    returned index sitemap has no instantiated children. The directly
+    referenced child sitemap URLs are returned separately for the caller to
+    schedule its own traversal (e.g. the incremental crawler).
+
+    :param url: Final (post-redirect) URL the content was loaded from.
+    :param content: Decoded, already gunzipped sitemap content.
+    :param recursion_level: Recursion depth, used only for limit checks.
+    :param web_client: Web client to pass through; never called because
+        recursion is blocked.
+    :param parent_urls: Set of parent URLs leading to this node.
+    :return: Tuple of the parsed sitemap and the ordered, de-duplicated list of
+        child sitemap URLs referenced by this node (empty for page sitemaps).
+    """
+    if not web_client:
+        web_client = LocalWebClient()
+    parent_urls = parent_urls or set()
+
+    # Block network recursion; child URLs are collected from the parser state.
+    recurse_callback = lambda child_url, level, urls: False
+
+    if content[:20].strip().startswith("<"):
+        parser = XMLSitemapParser(
+            url=url,
+            content=content,
+            recursion_level=recursion_level,
+            web_client=web_client,
+            parent_urls=parent_urls,
+            recurse_callback=recurse_callback,
+        )
+        sitemap = parser.sitemap()
+        if isinstance(sitemap, IndexXMLSitemap):
+            sub_sitemap_urls = list(parser._concrete_parser._sub_sitemap_urls)
+        else:
+            sub_sitemap_urls = []
+    elif url.endswith("/robots.txt"):
+        parser = IndexRobotsTxtSitemapParser(
+            url=url,
+            content=content,
+            recursion_level=recursion_level,
+            web_client=web_client,
+            parent_urls=parent_urls,
+            recurse_callback=recurse_callback,
+        )
+        sitemap = parser.sitemap()
+        sub_sitemap_urls = list(parser._sub_sitemap_urls)
+    else:
+        parser = PlainTextSitemapParser(
+            url=url,
+            content=content,
+            recursion_level=recursion_level,
+            web_client=web_client,
+            parent_urls=parent_urls,
+        )
+        sitemap = parser.sitemap()
+        sub_sitemap_urls = []
+
+    return sitemap, sub_sitemap_urls

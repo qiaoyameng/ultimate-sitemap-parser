@@ -15,6 +15,7 @@ Ultimate Sitemap Parser
     guides/sitemap-tree
     guides/fetch-parse
     guides/saving
+    guides/incremental
     guides/performance
     guides/security
     guides/http-client
